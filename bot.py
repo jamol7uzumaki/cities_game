@@ -1,0 +1,209 @@
+import os
+import http.server
+import socketserver
+import threading
+
+# Запускаем фиктивный веб-сервер для Render, чтобы пройти проверку порта
+def run_dummy_server():
+    port = int(os.environ.get("PORT", 10000))
+    handler = http.server.SimpleHTTPRequestHandler
+    with socketserver.TCPServer(("", port), handler) as httpd:
+        httpd.serve_forever()
+
+threading.Thread(target=run_dummy_server, daemon=True).start()
+
+TOKEN = os.getenv("BOT_TOKEN") or "9008129962:AAF6UbJ8ABuRkfB1mdwoLlGlUrJfWZ86rA"
+
+import asyncio
+import logging
+import sqlite3
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.filters import Command
+from aiogram.types import Message
+
+# Инициализация базы данных SQLite для групп
+def init_db():
+    conn = sqlite3.connect("countries_game.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS game_state (
+            chat_id INTEGER PRIMARY KEY,
+            current_country TEXT,
+            last_letter TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS used_countries (
+            chat_id INTEGER,
+            country TEXT,
+            PRIMARY KEY (chat_id, country)
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS players (
+            chat_id INTEGER,
+            user_id INTEGER,
+            username TEXT,
+            score INTEGER DEFAULT 0,
+            PRIMARY KEY (chat_id, user_id)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# Функция для получения последней рабочей буквы (игнорируем Ь, Ъ, Ы, Й)
+SUPPRESS_LETTERS = {'ь', 'ъ', 'ы', 'й'}
+def get_last_letter(country: str) -> str:
+    country = country.lower().strip()
+    for char in reversed(country):
+        if char not in SUPPRESS_LETTERS:
+            return char
+    return country[-1]
+
+# База данных реальных стран (названия в нижнем регистре)
+VALID_COUNTRIES = {
+    "узбекистан", "россия", "казахстан", "кыргызстан", "таджикистан", "туркменистан", 
+    "германия", "франция", "италия", "испания", "португалия", "греция", "турция", 
+    "египет", "китай", "япония", "индия", "канада", "бразилия", "аргентина", 
+    "австралия", "великобритания", "соединенные штаты америки", "сша", "мексика", 
+    "южная корея", "северная корея", "вьетнам", "таиланд", "индонезия", "малайзия", 
+    "иран", "ирак", "саудовская аравия", "оаэ", "пакистан", "афганистан", "польша", 
+    "украина", "беларусь", "румыния", "венгрия", "чехия", "швеция", "норвегия", 
+    "финляндия", "дания", "нидерланды", "бельгия", "швейцария", "австрия", "азербайджан",
+    "армения", "грузия", "молдова", "литва", "латвия", "эстония", "исландия", "ирландия"
+}
+
+dp = Dispatcher()
+
+@dp.message(Command("start_countries", "countries"))
+async def cmd_start_countries(message: Message):
+    if message.chat.type == "private":
+        await message.answer("Эта игра предназначена для групповых чатов! Добавьте меня в группу.")
+        return
+    
+    chat_id = message.chat.id
+    
+    conn = sqlite3.connect("countries_game.db")
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM game_state WHERE chat_id = ?", (chat_id,))
+    cursor.execute("DELETE FROM used_countries WHERE chat_id = ?", (chat_id,))
+    cursor.execute("""
+        INSERT INTO game_state (chat_id, current_country, last_letter) 
+        VALUES (?, NULL, NULL)
+    """, (chat_id,))
+    conn.commit()
+    conn.close()
+    
+    await message.answer(
+        "🗺 **Игра в страны началась!**\n\n"
+        "Правила простые:\n"
+        "1. Пишите название реальной страны.\n"
+        "2. Каждая следующая страна должна начинаться на ту же букву, которой заканчивалась предыдущая (буквы Ь, Ъ, Ы, Й пропускаются).\n"
+        "3. Одну и ту же страну нельзя назвать повторно в этом чате.\n\n"
+        "Любой участник может написать первую страну, чтобы запустить цепочку!"
+    )
+
+@dp.message(Command("top", "rating"))
+async def cmd_rating(message: Message):
+    if message.chat.type == "private":
+        return
+    
+    chat_id = message.chat.id
+    conn = sqlite3.connect("countries_game.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT username, score FROM players 
+        WHERE chat_id = ? ORDER BY score DESC LIMIT 10
+    """, (chat_id,))
+    top_players = cursor.fetchall()
+    conn.close()
+    
+    if not top_players:
+        await message.answer("🏆 В этом чате пока нет участников с очками. Начните игру командой /countries!")
+        return
+    
+    text = "🏆 **Рейтинг игроков в странах:**\n\n"
+    for i, (uname, score) in enumerate(top_players, 1):
+        name = uname if uname else "Аноним"
+        text += f"{i}. {name} — {score} очков\n"
+        
+    await message.answer(text)
+
+@dp.message(F.text & ~F.text.startswith("/"))
+async def handle_country_message(message: Message):
+    if message.chat.type == "private":
+        return
+
+    chat_id = message.chat.id
+    text_clean = message.text.strip().lower()
+    
+    conn = sqlite3.connect("countries_game.db")
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT current_country, last_letter FROM game_state WHERE chat_id = ?", (chat_id,))
+    state = cursor.fetchone()
+    
+    if not state:
+        conn.close()
+        return  # Игра не запущена в этом чате
+    
+    current_country, required_letter = state
+    country_name = text_clean.capitalize()
+    
+    # 1. Проверка: существует ли такая страна в нашей базе (Исправлено имя переменной)
+    if text_clean not in VALID_COUNTRIES:
+        conn.close()
+        await message.reply("❌ Такой страны нет в моем словаре! Попробуйте другую.")
+        return
+
+    # 2. Проверка первой буквы (если это не первый ход)
+    if required_letter is not None:
+        if text_clean[0] != required_letter:
+            conn.close()
+            await message.reply(f"❌ Неправильно! Страна должна начинаться на букву **«{required_letter.upper()}»**.")
+            return
+
+    # 3. Проверка, называлась ли страна ранее в этом чате
+    cursor.execute("SELECT 1 FROM used_countries WHERE chat_id = ? AND country = ?", (chat_id, text_clean))
+    if cursor.fetchone():
+        conn.close()
+        await message.reply("⚠️ Эту страну уже называли в данной игре!")
+        return
+
+    # Вычисляем новую требуемую букву
+    new_last_letter = get_last_letter(text_clean)
+
+    # Сохраняем и обновляем состояние
+    cursor.execute("INSERT OR IGNORE INTO used_countries (chat_id, country) VALUES (?, ?)", (chat_id, text_clean))
+    cursor.execute("UPDATE game_state SET current_country = ?, last_letter = ? WHERE chat_id = ?", 
+                   (text_clean, new_last_letter, chat_id))
+    
+    # Начисляем очки игроку
+    user = message.from_user
+    username = user.username or user.first_name
+    cursor.execute("""
+        INSERT INTO players (chat_id, user_id, username, score) 
+        VALUES (?, ?, ?, 1)
+        ON CONFLICT(chat_id, user_id) DO UPDATE SET score = score + 1
+    """, (chat_id, user.id, username))
+    
+    conn.commit()
+    conn.close()
+
+    # Успешный ответ
+    await message.react([types.ReactionTypeEmoji(emoji="👍")])
+    await message.reply(
+        f"✅ Принято: **{country_name}**!\n"
+        f"Следующий игрок называет страну на букву: **«{new_last_letter.upper()}»** 🔠"
+    )
+
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    bot = Bot(token=TOKEN)
+    print("Бот запущен...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
